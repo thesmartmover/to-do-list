@@ -93,11 +93,31 @@ class TaskBot {
 
         // Обработка всех сообщений
         this.bot.on('message', (msg) => this.handleMessage(msg));
-
+        
         // Обработка ошибок
         this.bot.on('error', (error) => {
             console.error('⚠️ Ошибка бота:', error.message);
         });
+
+        // Обработка нажатий на инлайн-кнопки
+        this.bot.on('callback_query', async (callbackQuery) => {
+            const msg = callbackQuery.message;
+            const data = callbackQuery.data;
+            const userId = callbackQuery.from.id;
+            const chatId = msg.chat.id;
+
+            // Обязательно отвечаем на callback, чтобы убрать "часики" на кнопке
+            await this.bot.answerCallbackQuery(callbackQuery.id);
+
+            if (data.startsWith('date_')) {
+                await this.handleDateSelection(userId, chatId, data);
+            } else if (data.startsWith('task_')) {
+                await this.handleTaskAction(userId, chatId, data, msg);
+            } else if (data.startsWith('cal_')) {
+                await this.handleCalendarDate(userId, chatId, data);
+            }
+        });
+
     }
 
     async handleMessage(msg) {
@@ -110,26 +130,45 @@ class TaskBot {
         const userId = msg.from.id;
         const text = msg.text;
 
+        // Обработка кнопок reply-клавиатуры
+        if (text === '➕ Добавить задачу') {
+            return commands.handleAddTask(this, msg);
+        }
+        if (text === '📋 Мои задачи') {
+            return commands.handleMyTasks(this, msg);
+        }
+        if (text === '📅 Неделя') {
+            return commands.handleWeekTasks(this, msg);
+        }
+        if (text === '❓ Помощь') {
+            return commands.handleHelp(this, msg);
+        }
+
         const state = this.userStates.get(`${userId}_${chatId}`);
 
+        // Состояние: ожидаем описание задачи
         if (state && state.waitingFor === 'taskText') {
             this.userStates.set(`${userId}_${chatId}`, {
                 ...state,
                 taskText: text,
                 waitingFor: 'taskDate'
             });
-            await this.bot.sendMessage(chatId, 
-                '📅 Отлично! Теперь укажите дату и время.\n\n' +
-                'Примеры:\n' +
-                '• 2024-12-31 23:59\n' +
-                '• завтра 15:30\n' +
-                '• через 2 часа\n' +
-                '• в пятницу 18:00\n\n' +
-                '(Для общей задачи добавьте #общее)'
-            );
+            const inlineKeyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: 'Сегодня', callback_data: 'date_today' }],
+                        [{ text: 'Завтра', callback_data: 'date_tomorrow' }],
+                        [{ text: 'На этой неделе', callback_data: 'date_thisweek' }],
+                        [{ text: 'Выбрать дату', callback_data: 'date_picker' }],
+                        [{ text: 'Отмена', callback_data: 'cancel' }]
+                    ]
+                }
+            };
+            await this.bot.sendMessage(chatId, '📅 Выберите дату:', inlineKeyboard);
             return;
         }
 
+        // Состояние: ожидаем дату (запасной вариант, если пользователь введёт текст вместо кнопок)
         if (state && state.waitingFor === 'taskDate') {
             try {
                 const parsedDate = this.parseDate(text);
@@ -176,6 +215,133 @@ class TaskBot {
             }
         }
     }
+
+    async handleDateSelection(userId, chatId, data) {
+    const state = this.userStates.get(`${userId}_${chatId}`);
+    if (!state) return;
+
+    let selectedDate;
+    const now = new Date();
+
+    switch (data) {
+        case 'date_today':
+            selectedDate = now;
+            break;
+        case 'date_tomorrow':
+            selectedDate = new Date(now);
+            selectedDate.setDate(now.getDate() + 1);
+            break;
+        case 'date_thisweek': {
+            const endOfWeek = new Date(now);
+            endOfWeek.setDate(now.getDate() + (7 - now.getDay()));
+            selectedDate = endOfWeek;
+            break;
+        }
+        case 'date_picker':
+            await this.showCalendar(chatId, userId);
+            return;
+        case 'cancel':
+            this.userStates.delete(`${userId}_${chatId}`);
+            await this.bot.sendMessage(chatId, '❌ Действие отменено.');
+            return;
+        default:
+            return;
+    }
+
+    // Устанавливаем время по умолчанию (12:00) или можно позже спросить
+    if (selectedDate) {
+        selectedDate.setHours(12, 0, 0, 0);
+        if (state.action === 'postpone') {
+            // Если откладываем задачу
+            await db.postponeTask(state.taskId, selectedDate);
+            this.userStates.delete(`${userId}_${chatId}`);
+            await this.bot.sendMessage(chatId, `✅ Задача отложена на ${selectedDate.toLocaleString('ru-RU')}`);
+        } else {
+            // Если создаём новую задачу
+            await this.createTask(userId, chatId, state.taskText, selectedDate);
+        }
+    }
+}
+
+async createTask(userId, chatId, text, date) {
+    const isGeneral = text.toLowerCase().includes('#общее');
+    await db.addTask({
+        userId,
+        chatId,
+        text,
+        date,
+        isGeneral
+    });
+    this.userStates.delete(`${userId}_${chatId}`);
+    await this.bot.sendMessage(chatId, `✅ Задача добавлена на ${date.toLocaleString('ru-RU')}`);
+}
+
+async showCalendar(chatId, userId) {
+    const days = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+    const now = new Date();
+    const buttons = [];
+
+    for (let i = 0; i < 7; i++) {
+        const date = new Date(now);
+        date.setDate(now.getDate() + i);
+        const dayIndex = date.getDay(); // 0 = вс, 1 = пн, ...
+        const dayName = days[dayIndex === 0 ? 6 : dayIndex - 1];
+        const label = `${date.getDate()} ${dayName}`;
+        buttons.push([{ text: label, callback_data: `cal_${date.toISOString()}` }]);
+    }
+
+    const inlineKeyboard = {
+        reply_markup: {
+            inline_keyboard: buttons
+        }
+    };
+    await this.bot.sendMessage(chatId, '📅 Выберите дату:', inlineKeyboard);
+}
+
+async handleCalendarDate(userId, chatId, data) {
+    const dateStr = data.replace('cal_', '');
+    const selectedDate = new Date(dateStr);
+    const state = this.userStates.get(`${userId}_${chatId}`);
+    
+    if (!state) return;
+
+    // Можно спросить время, но для простоты установим 12:00
+    selectedDate.setHours(12, 0, 0, 0);
+
+    if (state.action === 'postpone') {
+        await db.postponeTask(state.taskId, selectedDate);
+        this.userStates.delete(`${userId}_${chatId}`);
+        await this.bot.sendMessage(chatId, `✅ Задача отложена на ${selectedDate.toLocaleString('ru-RU')}`);
+    } else {
+        await this.createTask(userId, chatId, state.taskText, selectedDate);
+    }
+}
+
+async handleTaskAction(userId, chatId, data, msg) {
+    if (data.startsWith('task_done_')) {
+        const taskId = data.replace('task_done_', '');
+        await db.completeTask(taskId);
+        await this.bot.sendMessage(chatId, '✅ Задача отмечена выполненной!');
+        // Можно удалить сообщение с кнопками
+        await this.bot.deleteMessage(chatId, msg.message_id);
+    } else if (data.startsWith('task_postpone_')) {
+        const taskId = data.replace('task_postpone_', '');
+        this.userStates.set(`${userId}_${chatId}`, { action: 'postpone', taskId });
+        
+        const inlineKeyboard = {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: 'Сегодня', callback_data: 'date_today' }],
+                    [{ text: 'Завтра', callback_data: 'date_tomorrow' }],
+                    [{ text: 'На этой неделе', callback_data: 'date_thisweek' }],
+                    [{ text: 'Выбрать дату', callback_data: 'date_picker' }],
+                    [{ text: 'Отмена', callback_data: 'cancel' }]
+                ]
+            }
+        };
+        await this.bot.sendMessage(chatId, '⏳ Выберите новую дату:', inlineKeyboard);
+    }
+}
 
     parseDate(text) {
         const now = new Date();

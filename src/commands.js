@@ -26,6 +26,20 @@ class Commands {
         
         await botInstance.bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
         
+        // Добавляем reply-клавиатуру
+        const keyboard = {
+            reply_markup: {
+                keyboard: [
+                    [{ text: '➕ Добавить задачу' }],
+                    [{ text: '📋 Мои задачи' }, { text: '📅 Неделя' }],
+                    [{ text: '❓ Помощь' }]
+                ],
+                resize_keyboard: true,
+                one_time_keyboard: false
+            }
+        };
+        await botInstance.bot.sendMessage(chatId, 'Выберите действие:', keyboard);
+
         // Сохраняем пользователя
         try {
             await db.addUser(msg.from.id, chatId, msg.from);
@@ -104,18 +118,23 @@ class Commands {
                 await botInstance.bot.sendMessage(chatId, '📅 На сегодня задач нет!');
                 return;
             }
-            
-            let message = '📋 **Задачи на сегодня:**\n\n';
-            todayTasks.forEach((task, index) => {
-                const date = new Date(task.date).toLocaleTimeString('ru-RU', {
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
-                const type = task.isGeneral ? '👥' : '👤';
-                message += `${type} ${index + 1}. ${task.text} — ${date}\n`;
-            });
-            
-            await botInstance.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            await botInstance.bot.sendMessage(chatId, '📋 Ваши задачи на сегодня:');
+            for (const task of todayTasks) {
+                const taskDate = new Date(task.date);
+                const timeStr = taskDate.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                const taskMsg = `📌 ${task.text}\n⏰ ${timeStr}`;
+                const inlineKeyboard = {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '✅ Выполнено', callback_data: `task_done_${task._id}` },
+                             { text: '⏳ Отложить', callback_data: `task_postpone_${task._id}` }  
+                            ]
+                        ]
+                    }
+                };
+                await botInstance.bot.sendMessage(chatId, taskMsg, inlineKeyboard);
+            }
+                     
         } catch (error) {
             console.error('Ошибка при получении задач:', error);
             await botInstance.bot.sendMessage(chatId, '❌ Ошибка при получении задач');
